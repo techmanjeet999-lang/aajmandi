@@ -105,6 +105,12 @@ def main():
         start = end - timedelta(days=3)
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        # Create the table on first run (schema.sql only uses "if not exists").
+        schema = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+        with open(schema) as f:
+            conn.execute(f.read())
+        conn.commit()
+
         day = start
         while day <= end:
             records = fetch_day(day)

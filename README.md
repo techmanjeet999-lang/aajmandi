@@ -3,7 +3,7 @@
 Fetches daily Haryana mandi prices from data.gov.in and saves them into a Supabase (PostgreSQL) database.
 
 ## Setup
-1. In Supabase, open **SQL Editor**, paste `schema.sql` and run it.
+1. The script creates the `mandi_prices` table itself on its first run (from `schema.sql`).
 2. In this repo: **Settings > Secrets and variables > Actions**, add:
    - `DATA_GOV_API_KEY`: your data.gov.in API key
    - `DATABASE_URL`: Supabase **Session pooler** connection string
