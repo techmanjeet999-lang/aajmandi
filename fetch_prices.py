@@ -97,6 +97,11 @@ def to_row(rec, day):
 
 
 def main():
+    missing = [k for k in ("DATA_GOV_API_KEY", "DATABASE_URL") if not os.environ.get(k)]
+    if missing:
+        sys.exit(f"Missing secret(s): {', '.join(missing)}. Add them under "
+                 "Settings > Secrets and variables > Actions > Repository secrets.")
+
     if len(sys.argv) == 3:
         start = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
         end = datetime.strptime(sys.argv[2], "%Y-%m-%d").date()
