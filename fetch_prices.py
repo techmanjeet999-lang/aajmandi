@@ -23,6 +23,8 @@ RESOURCE = "35985678-0d79-46b4-9ed6-6f13308a1d24"
 URL = f"https://api.data.gov.in/resource/{RESOURCE}"
 STATE = "Haryana"
 PAGE = 1000
+# data.gov.in's firewall drops the default python-requests User-Agent.
+HEADERS = {"User-Agent": "mandi-bhav/1.0 (+https://github.com/manjeet123/mandi)"}
 
 UPSERT = """
 insert into mandi_prices (arrival_date, state, district, market, commodity, variety, grade,
@@ -65,7 +67,7 @@ def fetch_day(day: date):
         }
         for attempt in range(4):
             try:
-                r = requests.get(URL, params=params, timeout=60)
+                r = requests.get(URL, params=params, headers=HEADERS, timeout=(15, 90))
                 r.raise_for_status()
                 break
             except requests.RequestException:
@@ -123,7 +125,7 @@ def main():
             with conn.cursor() as cur:
                 cur.executemany(UPSERT, rows)
             conn.commit()
-            print(f"{day}: {len(records)} fetched, {len(rows)} saved")
+            print(f"{day}: {len(records)} fetched, {len(rows)} saved", flush=True)
             day += timedelta(days=1)
 
 
