@@ -3,6 +3,9 @@
 Usage:
   python fetch_prices.py                 # today and the previous 3 days
   python fetch_prices.py 2026-10-01 2026-10-15   # a date range (backfill)
+  python fetch_prices.py --state Rajasthan       # another state (default Haryana)
+  python fetch_prices.py --state "Bihar,Punjab"  # several states
+  python fetch_prices.py --state all             # every state in India
 
 Needs two environment variables (in a .env file locally, GitHub Secrets in Actions):
   DATA_GOV_API_KEY   your data.gov.in key
@@ -26,15 +29,44 @@ PAGE = 1000
 # data.gov.in's firewall drops the default python-requests User-Agent.
 HEADERS = {"User-Agent": "mandi-bhav/1.0 (+https://github.com/manjeet123/mandi)"}
 
+# "do update" on a no-op change makes "returning id" work for rows that already exist.
+GET_STATE = """insert into states (name) values (%s)
+on conflict (name) do update set name = excluded.name returning id"""
+GET_DISTRICT = """insert into districts (state_id, name) values (%s, %s)
+on conflict (state_id, name) do update set name = excluded.name returning id"""
+GET_MANDI = """insert into mandis (district_id, name) values (%s, %s)
+on conflict (district_id, name) do update set name = excluded.name returning id"""
+GET_CROP = """insert into crops (name, agmarknet_code) values (%s, %s)
+on conflict (name) do update set agmarknet_code = coalesce(excluded.agmarknet_code, crops.agmarknet_code)
+returning id"""
+
 UPSERT = """
-insert into mandi_prices (arrival_date, state, district, market, commodity, variety, grade,
-                          commodity_code, min_price, max_price, modal_price)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-on conflict (arrival_date, state, district, market, commodity, variety, grade)
+insert into prices (mandi_id, crop_id, variety, grade, price_date, min_price, max_price, modal_price)
+values (%s, %s, %s, %s, %s, %s, %s, %s)
+on conflict (mandi_id, crop_id, variety, grade, price_date)
 do update set min_price = excluded.min_price, max_price = excluded.max_price,
-              modal_price = excluded.modal_price, commodity_code = excluded.commodity_code,
-              fetched_at = now()
+              modal_price = excluded.modal_price, fetched_at = now()
 """
+
+
+class Ids:
+    """Looks up (or creates) state, district, mandi and crop ids, caching them per run."""
+
+    def __init__(self, conn):
+        self.conn, self.cache = conn, {}
+
+    def _get(self, sql, *args):
+        key = (sql, args)
+        if key not in self.cache:
+            self.cache[key] = self.conn.execute(sql, args).fetchone()[0]
+        return self.cache[key]
+
+    def price_row(self, row):
+        day, state, district, market, commodity, variety, grade, code, lo, hi, modal = row
+        district_id = self._get(GET_DISTRICT, self._get(GET_STATE, state), district)
+        mandi_id = self._get(GET_MANDI, district_id, market)
+        crop_id = self._get(GET_CROP, commodity, code)
+        return (mandi_id, crop_id, variety, grade, day, lo, hi, modal)
 
 
 def field(rec, name):
@@ -53,8 +85,8 @@ def price(v):
     return p if p > 0 else None
 
 
-def fetch_day(day: date):
-    """Return every Haryana record for one arrival date, following pages."""
+def fetch_day(day: date, state: str):
+    """Return every record for one state (or "all" states) and arrival date, following pages."""
     rows, offset = [], 0
     while True:
         params = {
@@ -62,9 +94,10 @@ def fetch_day(day: date):
             "format": "json",
             "limit": PAGE,
             "offset": offset,
-            "filters[State]": STATE,
             "filters[Arrival_Date]": day.strftime("%d-%m-%Y"),
         }
+        if state.lower() != "all":
+            params["filters[State]"] = state
         for attempt in range(4):
             try:
                 r = requests.get(URL, params=params, headers=HEADERS, timeout=(15, 90))
@@ -81,13 +114,14 @@ def fetch_day(day: date):
         offset += PAGE
 
 
-def to_row(rec, day):
+def to_row(rec, day, state):
     lo, hi, modal = (price(field(rec, f)) for f in ("Min_Price", "Max_Price", "Modal_Price"))
-    if modal is None or (lo and hi and lo > hi):
+    state = (field(rec, "State") or "").strip() or (state if state.lower() != "all" else "")
+    if modal is None or not state or (lo and hi and lo > hi):
         return None  # skip obviously broken rows
     return (
         day,
-        field(rec, "State") or STATE,
+        state,
         (field(rec, "District") or "").strip(),
         (field(rec, "Market") or "").strip(),
         (field(rec, "Commodity") or "").strip(),
@@ -104,9 +138,17 @@ def main():
         sys.exit(f"Missing secret(s): {', '.join(missing)}. Add them under "
                  "Settings > Secrets and variables > Actions > Repository secrets.")
 
-    if len(sys.argv) == 3:
-        start = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
-        end = datetime.strptime(sys.argv[2], "%Y-%m-%d").date()
+    # --state takes one name, a comma-separated list, or "all".
+    states = [STATE]
+    args = sys.argv[1:]
+    if "--state" in args:
+        i = args.index("--state")
+        states = [s.strip() for s in args[i + 1].split(",") if s.strip()]
+        del args[i:i + 2]
+
+    if len(args) == 2:
+        start = datetime.strptime(args[0], "%Y-%m-%d").date()
+        end = datetime.strptime(args[1], "%Y-%m-%d").date()
     else:
         end = date.today()
         start = end - timedelta(days=3)
@@ -118,14 +160,16 @@ def main():
             conn.execute(f.read())
         conn.commit()
 
+        ids = Ids(conn)
         day = start
         while day <= end:
-            records = fetch_day(day)
-            rows = [r for r in (to_row(rec, day) for rec in records) if r]
-            with conn.cursor() as cur:
-                cur.executemany(UPSERT, rows)
-            conn.commit()
-            print(f"{day}: {len(records)} fetched, {len(rows)} saved", flush=True)
+            for state in states:
+                records = fetch_day(day, state)
+                rows = [ids.price_row(r) for r in (to_row(rec, day, state) for rec in records) if r]
+                with conn.cursor() as cur:
+                    cur.executemany(UPSERT, rows)
+                conn.commit()
+                print(f"{state} {day}: {len(records)} fetched, {len(rows)} saved", flush=True)
             day += timedelta(days=1)
 
 
